@@ -1,0 +1,46 @@
+# ── Green Deployment (version: green) ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}-green
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_NAME}
+    version: green
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+      version: green
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+        version: green
+    spec:
+      containers:
+        - name: ${APP_NAME}
+          image: ${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
