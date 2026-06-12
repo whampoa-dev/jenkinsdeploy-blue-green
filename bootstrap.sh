@@ -2,7 +2,7 @@
 # ──────────────────────────────────────────────────────────
 # Bootstrap — 一键初始化 Blue/Green 基础设施
 # 在 kind 集群中创建:
-#   - myapp-blue  (2 replicas, 接线上流量)
+#   - myapp-blue  (1 replica, 接线上流量)
 #   - myapp-green (0 replicas, 空闲)
 #   - myapp-svc   (Service, 路由到 blue)
 #   - harbor-secret (镜像拉取凭证)
@@ -29,7 +29,7 @@ $K create secret docker-registry harbor-secret \
   --docker-username=${HARBOR_USER} \
   --docker-password="${HARBOR_PASS}"
 
-# ── 2. Blue Deployment (live, 2 replicas) ──
+# ── 2. Blue Deployment (live, 1 replica) ──
 echo "=== Creating ${APP_NAME}-blue ==="
 $K delete deployment ${APP_NAME}-blue -n ${NAMESPACE} --ignore-not-found
 cat <<YAML | $K apply -n ${NAMESPACE} -f -
@@ -40,7 +40,7 @@ metadata:
   namespace: ${NAMESPACE}
   labels: {app: ${APP_NAME}, version: blue}
 spec:
-  replicas: 2
+  replicas: 1
   revisionHistoryLimit: 3
   selector:
     matchLabels: {app: ${APP_NAME}, version: blue}

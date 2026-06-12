@@ -9,7 +9,7 @@ metadata:
     app: ${APP_NAME}
     version: blue
 spec:
-  replicas: 2
+  replicas: 1
   revisionHistoryLimit: 3
   selector:
     matchLabels:
