@@ -198,9 +198,9 @@ echo "${deployName} is ready (NOT receiving live traffic)"
 
                             for i in 1 2 3; do
                                 CODE=\$(docker exec k8s-lab-control-plane kubectl \
-                                    run verify-\$\$ --rm -i --restart=Never --image=harbor.gujunhuafu.xyz/devops/curl:latest -- \
+                                    run verify-\$\$ -q --rm -i --restart=Never --image=harbor.gujunhuafu.xyz/devops/curl:latest -- \
                                     curl -s -o /dev/null -w "%{http_code}" \
-                                    "http://${liveSvc}.${params.NAMESPACE}.svc.cluster.local:80/healthz" 2>/dev/null || echo "000")
+                                    "http://${liveSvc}.${params.NAMESPACE}.svc.cluster.local:80/healthz" 2>/dev/null | tail -1)
                                 echo "  attempt \$i → HTTP \${CODE}"
                                 if [ "\${CODE}" = "200" ]; then
                                     echo "✅ Verification PASSED"
