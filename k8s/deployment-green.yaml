@@ -8,8 +8,8 @@ metadata:
     app: ${APP_NAME}
     version: green
 spec:
-  replicas: 2
-  revisionHistoryLimit: 3
+  replicas: 1
+  revisionHistoryLimit: 2
   selector:
     matchLabels:
       app: ${APP_NAME}
