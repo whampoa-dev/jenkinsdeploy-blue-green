@@ -8,7 +8,7 @@ pipeline {
                 description: 'Image tag (defaults to BUILD_NUMBER)' )
         string( name: 'NAMESPACE',       defaultValue: 'default',
                 description: 'Kubernetes namespace' )
-        string( name: 'HARBOR_PROJECT',  defaultValue: 'devops',
+        string( name: 'HARBOR_PROJECT',  defaultValue: 'library',
                 description: 'Harbor project name' )
         string( name: 'DOCKERFILE_PATH', defaultValue: 'Dockerfile',
                 description: 'Path to Dockerfile relative to workspace' )
@@ -25,6 +25,7 @@ pipeline {
         HARBOR_USER  = 'admin'
         HARBOR_PASS  = 'Zlwloveyou663484$'
         SSH_OPTS     = '-o StrictHostKeyChecking=no'
+        K8S_CLUSTER  = 'k8s-lab'
     }
 
     stages {
@@ -43,11 +44,12 @@ pipeline {
         stage('Detect Live Track') {
             steps {
                 script {
+                    def rhost   = "${params.REMOTE_USER}@${params.REMOTE_HOST}"
                     def liveSvc = "${params.APP_NAME}-svc"
                     def nsOpt   = "-n ${params.NAMESPACE}"
 
                     def liveVer = sh(
-                        script: "ssh ${SSH_OPTS} ${params.REMOTE_USER}@${params.REMOTE_HOST} " +
+                        script: "ssh ${SSH_OPTS} ${rhost} " +
                                 "'docker exec k8s-lab-control-plane kubectl " +
                                 "get svc " + liveSvc + " " + nsOpt + " " +
                                 "-o jsonpath='\"'\"'{.spec.selector.version}'\"'\"' 2>/dev/null || echo blue'",
@@ -58,28 +60,36 @@ pipeline {
                     env.LIVE_VERSION     = liveVer
                     env.INACTIVE_VERSION = (liveVer == 'blue') ? 'green' : 'blue'
 
-                    echo "Current live:  ${env.LIVE_VERSION}"
-                    echo "Will deploy to: ${env.INACTIVE_VERSION}"
+                    echo "Live:     ${env.LIVE_VERSION}"
+                    echo "Inactive: ${env.INACTIVE_VERSION}"
                 }
             }
         }
 
-        // ── 2. Build & Push (via SSH to Docker host) ──────────
+        // ── 2. Build → Push → Load into kind ─────────────────
         stage('Build & Push') {
             steps {
                 script {
-                    def imageTag  = params.IMAGE_TAG ?: env.BUILD_NUMBER
-                    def imageFull = "${HARBOR_HOST}/${params.HARBOR_PROJECT}/${params.APP_NAME}:${imageTag}"
-                    def rhost     = "${params.REMOTE_USER}@${params.REMOTE_HOST}"
+                    def imageTag   = params.IMAGE_TAG ?: env.BUILD_NUMBER
+                    def imageFull  = "${HARBOR_HOST}/${params.HARBOR_PROJECT}/${params.APP_NAME}:${imageTag}"
+                    def rhost      = "${params.REMOTE_USER}@${params.REMOTE_HOST}"
+                    def kcluster   = env.K8S_CLUSTER
 
-                    // Write a shell script with all vars baked in, then run remotely
-                    writeFile file: 'build-push.sh', text: """#!/bin/bash
+                    // Write build script
+                    writeFile file: 'build.sh', text: """#!/bin/bash
 set -e
-cd /tmp/jenkins-build
+export PATH=\$HOME/go/bin:\$PATH
+
 echo '${HARBOR_PASS}' | docker login ${HARBOR_HOST} -u '${HARBOR_USER}' --password-stdin
+
+cd /tmp/jenkins-build
 docker build -t '${imageFull}' -f ${params.DOCKERFILE_PATH} .
 docker push '${imageFull}'
-echo "Pushed: ${imageFull}"
+
+echo '=== Loading image into kind cluster ==='
+kind load docker-image '${imageFull}' --name ${kcluster}
+
+echo 'DONE: ${imageFull}'
 """
 
                     sh """
@@ -87,16 +97,15 @@ echo "Pushed: ${imageFull}"
                         ssh ${SSH_OPTS} '${rhost}' 'mkdir -p /tmp/jenkins-build'
                         tar czf - . | ssh ${SSH_OPTS} '${rhost}' 'tar xzf - -C /tmp/jenkins-build'
 
-                        echo "Building ${imageFull} on remote ..."
-                        scp ${SSH_OPTS} build-push.sh '${rhost}':/tmp/build-push.sh
-                        ssh ${SSH_OPTS} '${rhost}' 'bash /tmp/build-push.sh'
+                        scp ${SSH_OPTS} build.sh '${rhost}':/tmp/build.sh
+                        ssh ${SSH_OPTS} '${rhost}' 'bash /tmp/build.sh'
                     """
                 }
             }
         }
 
-        // ── 3. Deploy to K8s ──────────────────────────────────
-        stage('Deploy to K8s') {
+        // ── 3. Deploy to Inactive Track ───────────────────────
+        stage('Deploy to Inactive') {
             steps {
                 script {
                     def imageTag       = params.IMAGE_TAG ?: env.BUILD_NUMBER
@@ -114,14 +123,14 @@ export DOCKER_REGISTRY='${dockerRegistry}'
 export IMAGE_TAG='${imageTag}'
 
 cd /tmp/jenkins-build
-echo "Deploying ${deployName} ..."
+echo "Deploying ${deployName} (INACTIVE track — no live traffic) ..."
 envsubst < ${manifest} \
     | docker exec -i k8s-lab-control-plane kubectl apply ${nsOpt} -f -
 
 docker exec k8s-lab-control-plane kubectl \
-    rollout status deployment/${deployName} ${nsOpt} --timeout=300s
+    rollout status deployment/${deployName} ${nsOpt} --timeout=120s
 
-echo "${deployName} is ready"
+echo "${deployName} is ready (NOT receiving live traffic)"
 """
 
                     sh """
@@ -132,7 +141,120 @@ echo "${deployName} is ready"
             }
         }
 
+        // ── 4. 🔵🟢 Switch Traffic ─────────────────────────────
+        stage('Switch Traffic') {
+            steps {
+                script {
+                    def liveSvc = "${params.APP_NAME}-svc"
+                    def oldVer  = env.LIVE_VERSION
+                    def newVer  = env.INACTIVE_VERSION
+                    def nsOpt   = "-n ${params.NAMESPACE}"
+                    def rhost   = "${params.REMOTE_USER}@${params.REMOTE_HOST}"
+
+                    sh """
+                        ssh ${SSH_OPTS} '${rhost}' '
+                            echo "═══════════════════════════════════"
+                            echo "  BLUE/GREEN SWITCH"
+                            echo "  ${oldVer} ─────▶ ${newVer}"
+                            echo "═══════════════════════════════════"
+
+                            BEFORE=\$(docker exec k8s-lab-control-plane kubectl \
+                                get svc ${liveSvc} ${nsOpt} -o jsonpath="{.spec.selector.version}")
+                            echo "Before: selector.version = \${BEFORE}"
+
+                            docker exec k8s-lab-control-plane kubectl \
+                                patch svc ${liveSvc} ${nsOpt} --type=merge \
+                                -p "{\\"spec\\":{\\"selector\\":{\\"version\\":\\"${newVer}\\"}}}"
+
+                            AFTER=\$(docker exec k8s-lab-control-plane kubectl \
+                                get svc ${liveSvc} ${nsOpt} -o jsonpath="{.spec.selector.version}")
+                            echo "After:  selector.version = \${AFTER}"
+
+                            echo "✅ Traffic switched: ${oldVer} → ${newVer}"
+                        '
+                    """
+                }
+            }
+        }
+
+        // ── 5. Verify Live ────────────────────────────────────
+        stage('Verify Live') {
+            steps {
+                script {
+                    def liveSvc = "${params.APP_NAME}-svc"
+                    def nsOpt   = "-n ${params.NAMESPACE}"
+                    def oldVer  = env.LIVE_VERSION
+                    def newVer  = env.INACTIVE_VERSION
+                    def rhost   = "${params.REMOTE_USER}@${params.REMOTE_HOST}"
+
+                    sh """
+                        ssh ${SSH_OPTS} '${rhost}' '
+                            echo "Verifying live traffic on ${newVer} ..."
+
+                            READY=\$(docker exec k8s-lab-control-plane kubectl \
+                                get deployment ${params.APP_NAME}-${newVer} ${nsOpt} \
+                                -o jsonpath="{.status.readyReplicas}")
+                            echo "Ready replicas (${newVer}): \${READY}"
+
+                            for i in 1 2 3; do
+                                CODE=\$(docker exec k8s-lab-control-plane kubectl \
+                                    run verify-\$\$ --rm -i --restart=Never --image=curlimages/curl -- \
+                                    curl -s -o /dev/null -w "%{http_code}" \
+                                    "http://${liveSvc}.${params.NAMESPACE}.svc.cluster.local:80/healthz" 2>/dev/null || echo "000")
+                                echo "  attempt \$i → HTTP \${CODE}"
+                                if [ "\${CODE}" = "200" ]; then
+                                    echo "✅ Verification PASSED"
+                                    exit 0
+                                fi
+                                sleep 3
+                            done
+
+                            echo "❌ FAILED — rolling back..."
+                            docker exec k8s-lab-control-plane kubectl \
+                                patch svc ${liveSvc} ${nsOpt} --type=merge \
+                                -p "{\\"spec\\":{\\"selector\\":{\\"version\\":\\"${oldVer}\\"}}}"
+                            exit 1
+                        '
+                    """
+                }
+            }
+        }
+
+        // ── 6. Cleanup Old Track ──────────────────────────────
+        stage('Cleanup') {
+            steps {
+                script {
+                    def oldDeploy = "${params.APP_NAME}-${env.LIVE_VERSION}"
+                    def nsOpt     = "-n ${params.NAMESPACE}"
+                    def rhost     = "${params.REMOTE_USER}@${params.REMOTE_HOST}"
+
+                    sh """
+                        ssh ${SSH_OPTS} '${rhost}' "
+                            echo 'Scaling down old track: ${oldDeploy} → 0'
+                            docker exec k8s-lab-control-plane kubectl \
+                                scale deployment ${oldDeploy} ${nsOpt} --replicas=0
+                            echo '✅ Old track ${env.LIVE_VERSION} scaled to 0 (kept for rollback)'
+                        "
+                    """
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo """
+            ╔═══════════════════════════════════╗
+            ║  Blue/Green Deploy SUCCESS      ║
+            ║  App:   ${params.APP_NAME}      ║
+            ║  Tag:   ${params.IMAGE_TAG ?: env.BUILD_NUMBER}  ║
+            ║  Live:  ${env.INACTIVE_VERSION} ║
+            ╚═══════════════════════════════════╝
+            """
+        }
+        failure {
+            echo "❌ Pipeline FAILED — check logs above"
+        }
     }
 }
-
-

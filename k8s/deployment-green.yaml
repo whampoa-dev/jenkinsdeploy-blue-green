@@ -1,4 +1,5 @@
 # ── Green Deployment (version: green) ──
+# Image loaded via: kind load docker-image --name k8s-lab
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,8 +9,8 @@ metadata:
     app: ${APP_NAME}
     version: green
 spec:
-  replicas: 1
-  revisionHistoryLimit: 2
+  replicas: 2
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
       app: ${APP_NAME}
@@ -20,28 +21,24 @@ spec:
         app: ${APP_NAME}
         version: green
     spec:
+      imagePullSecrets:
+        - name: harbor-secret
       containers:
         - name: ${APP_NAME}
           image: ${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           readinessProbe:
             httpGet:
               path: /healthz
               port: 8080
-            initialDelaySeconds: 5
-            periodSeconds: 5
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 8080
-            initialDelaySeconds: 15
-            periodSeconds: 10
+            initialDelaySeconds: 3
+            periodSeconds: 3
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: 200m
+              memory: 128Mi
