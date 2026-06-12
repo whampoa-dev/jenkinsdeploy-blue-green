@@ -8,7 +8,7 @@ pipeline {
                 description: 'Image tag (defaults to BUILD_NUMBER)' )
         string( name: 'NAMESPACE',       defaultValue: 'default',
                 description: 'Kubernetes namespace' )
-        string( name: 'HARBOR_PROJECT',  defaultValue: 'library',
+        string( name: 'HARBOR_PROJECT',  defaultValue: 'devops',
                 description: 'Harbor project name' )
         string( name: 'DOCKERFILE_PATH', defaultValue: 'Dockerfile',
                 description: 'Path to Dockerfile relative to workspace' )

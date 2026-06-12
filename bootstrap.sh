@@ -52,7 +52,7 @@ spec:
         - name: harbor-secret
       containers:
         - name: ${APP_NAME}
-          image: ${HARBOR_HOST}/library/${APP_NAME}:latest
+          image: ${HARBOR_HOST}/devops/${APP_NAME}:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -81,7 +81,7 @@ spec:
         - name: harbor-secret
       containers:
         - name: ${APP_NAME}
-          image: ${HARBOR_HOST}/library/${APP_NAME}:latest
+          image: ${HARBOR_HOST}/devops/${APP_NAME}:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
