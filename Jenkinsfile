@@ -1,273 +1,136 @@
 pipeline {
     agent any
 
-    // ── Parameters ──────────────────────────────────────────────
     parameters {
-        string(
-            name: 'APP_NAME',
-            defaultValue: 'myapp',
-            description: 'Application name (used for K8s resource naming)'
-        )
-        string(
-            name: 'IMAGE_TAG',
-            defaultValue: '',
-            description: 'Docker image tag to deploy (defaults to BUILD_NUMBER)'
-        )
-        string(
-            name: 'NAMESPACE',
-            defaultValue: 'default',
-            description: 'Kubernetes namespace'
-        )
-        string(
-            name: 'DOCKER_REGISTRY',
-            defaultValue: 'registry.example.com',
-            description: 'Docker registry host'
-        )
-        string(
-            name: 'DOCKERFILE_PATH',
-            defaultValue: 'Dockerfile',
-            description: 'Path to Dockerfile relative to workspace'
-        )
-        choice(
-            name: 'SMOKE_TEST_ENABLED',
-            choices: ['yes', 'no'],
-            description: 'Run smoke test against inactive track before switch?'
-        )
-        choice(
-            name: 'AUTO_SWITCH',
-            choices: ['yes', 'no'],
-            description: 'Automatically switch traffic after smoke test? (no = manual approval)'
-        )
+        string( name: 'APP_NAME',        defaultValue: 'myapp',
+                description: 'Application name' )
+        string( name: 'IMAGE_TAG',       defaultValue: '',
+                description: 'Image tag (defaults to BUILD_NUMBER)' )
+        string( name: 'NAMESPACE',       defaultValue: 'default',
+                description: 'Kubernetes namespace' )
+        string( name: 'HARBOR_PROJECT',  defaultValue: 'library',
+                description: 'Harbor project name' )
+        string( name: 'DOCKERFILE_PATH', defaultValue: 'Dockerfile',
+                description: 'Path to Dockerfile relative to workspace' )
+        string( name: 'REMOTE_HOST',     defaultValue: '192.168.0.4',
+                description: 'Remote Docker/K8s host IP' )
+        string( name: 'REMOTE_USER',     defaultValue: 'steven',
+                description: 'SSH user on remote host' )
     }
 
     environment {
-        // Derive IMAGE_TAG from BUILD_NUMBER if not explicitly set
-        IMAGE_TAG        = "${params.IMAGE_TAG ? params.IMAGE_TAG : env.BUILD_NUMBER}"
-        LIVE_SVC         = "${params.APP_NAME}-svc"
-        PREVIEW_SVC      = "${params.APP_NAME}-preview"
-        DEPLOY_BLUE      = "${params.APP_NAME}-blue"
-        DEPLOY_GREEN     = "${params.APP_NAME}-green"
-        K8S_MANIFEST_DIR = "k8s"
+        GIT_REPO     = 'https://github.com/whampoa-dev/jenkinsdeploy-blue-green.git'
+        GIT_BRANCH   = 'feature20260611'
+        HARBOR_HOST  = 'harbor.gujunhuafu.xyz'
+        HARBOR_USER  = 'admin'
+        HARBOR_PASS  = 'Zlwloveyou663484$'
+        SSH_OPTS     = '-o StrictHostKeyChecking=no'
     }
 
     stages {
 
-        // ── Stage 1: Detect current live track ────────────────────
+        // ── 0. Checkout ───────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "${GIT_BRANCH}"]],
+                    userRemoteConfigs: [[url: "${GIT_REPO}"]]
+                ])
+            }
+        }
+
+        // ── 1. Detect Live Track ──────────────────────────────
         stage('Detect Live Track') {
             steps {
                 script {
-                    sh '''
-                        echo "=== Detecting current live track ==="
-                        LIVE_VERSION=$(kubectl get svc ${LIVE_SVC} -n ${NAMESPACE} \
-                            -o jsonpath='{.spec.selector.version}' 2>/dev/null || echo "blue")
+                    def liveSvc = "${params.APP_NAME}-svc"
+                    def nsOpt   = "-n ${params.NAMESPACE}"
 
-                        if [ "${LIVE_VERSION}" != "blue" ] && [ "${LIVE_VERSION}" != "green" ]; then
-                            LIVE_VERSION="blue"
-                        fi
+                    def liveVer = sh(
+                        script: "ssh ${SSH_OPTS} ${params.REMOTE_USER}@${params.REMOTE_HOST} " +
+                                "'docker exec k8s-lab-control-plane kubectl " +
+                                "get svc " + liveSvc + " " + nsOpt + " " +
+                                "-o jsonpath='\"'\"'{.spec.selector.version}'\"'\"' 2>/dev/null || echo blue'",
+                        returnStdout: true
+                    ).trim()
 
-                        if [ "${LIVE_VERSION}" = "blue" ]; then
-                            INACTIVE_VERSION="green"
-                        else
-                            INACTIVE_VERSION="blue"
-                        fi
+                    if (liveVer != 'blue' && liveVer != 'green') { liveVer = 'blue' }
+                    env.LIVE_VERSION     = liveVer
+                    env.INACTIVE_VERSION = (liveVer == 'blue') ? 'green' : 'blue'
 
-                        echo "LIVE_VERSION=${LIVE_VERSION}"      >  track.env
-                        echo "INACTIVE_VERSION=${INACTIVE_VERSION}" >> track.env
-                        echo "→ Current live: ${LIVE_VERSION}"
-                        echo "→ Inactive:     ${INACTIVE_VERSION}"
-                    '''
-                    stash name: 'track', includes: 'track.env'
+                    echo "Current live:  ${env.LIVE_VERSION}"
+                    echo "Will deploy to: ${env.INACTIVE_VERSION}"
                 }
             }
         }
 
-        // ── Stage 2: Build & Push Docker image ───────────────────
+        // ── 2. Build & Push (via SSH to Docker host) ──────────
         stage('Build & Push') {
             steps {
                 script {
-                    sh '''
-                        IMAGE_FULL="${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
-                        echo "=== Building ${IMAGE_FULL} ==="
-                        docker build -t "${IMAGE_FULL}" -f "${DOCKERFILE_PATH}" .
-                        docker push "${IMAGE_FULL}"
-                        echo "→ Pushed: ${IMAGE_FULL}"
-                    '''
+                    def imageTag  = params.IMAGE_TAG ?: env.BUILD_NUMBER
+                    def imageFull = "${HARBOR_HOST}/${params.HARBOR_PROJECT}/${params.APP_NAME}:${imageTag}"
+                    def rhost     = "${params.REMOTE_USER}@${params.REMOTE_HOST}"
+
+                    // Write a shell script with all vars baked in, then run remotely
+                    writeFile file: 'build-push.sh', text: """#!/bin/bash
+set -e
+cd /tmp/jenkins-build
+echo '${HARBOR_PASS}' | docker login ${HARBOR_HOST} -u '${HARBOR_USER}' --password-stdin
+docker build -t '${imageFull}' -f ${params.DOCKERFILE_PATH} .
+docker push '${imageFull}'
+echo "Pushed: ${imageFull}"
+"""
+
+                    sh """
+                        echo "Syncing code to ${rhost} ..."
+                        ssh ${SSH_OPTS} '${rhost}' 'mkdir -p /tmp/jenkins-build'
+                        tar czf - . | ssh ${SSH_OPTS} '${rhost}' 'tar xzf - -C /tmp/jenkins-build'
+
+                        echo "Building ${imageFull} on remote ..."
+                        scp ${SSH_OPTS} build-push.sh '${rhost}':/tmp/build-push.sh
+                        ssh ${SSH_OPTS} '${rhost}' 'bash /tmp/build-push.sh'
+                    """
                 }
             }
         }
 
-        // ── Stage 3: Deploy to INACTIVE track ────────────────────
-        stage('Deploy to Inactive') {
+        // ── 3. Deploy to K8s ──────────────────────────────────
+        stage('Deploy to K8s') {
             steps {
                 script {
-                    unstash 'track'
-                    sh '''
-                        # Load track info
-                        . ./track.env
+                    def imageTag       = params.IMAGE_TAG ?: env.BUILD_NUMBER
+                    def dockerRegistry = "${HARBOR_HOST}/${params.HARBOR_PROJECT}"
+                    def deployName     = "${params.APP_NAME}-${env.INACTIVE_VERSION}"
+                    def manifest       = "k8s/deployment-${env.INACTIVE_VERSION}.yaml"
+                    def nsOpt          = "-n ${params.NAMESPACE}"
+                    def rhost          = "${params.REMOTE_USER}@${params.REMOTE_HOST}"
 
-                        DEPLOYMENT="${APP_NAME}-${INACTIVE_VERSION}"
-                        MANIFEST="${K8S_MANIFEST_DIR}/deployment-${INACTIVE_VERSION}.yaml"
+                    writeFile file: 'deploy.sh', text: """#!/bin/bash
+set -e
+export APP_NAME='${params.APP_NAME}'
+export NAMESPACE='${params.NAMESPACE}'
+export DOCKER_REGISTRY='${dockerRegistry}'
+export IMAGE_TAG='${imageTag}'
 
-                        echo "=== Deploying to ${DEPLOYMENT} (${INACTIVE_VERSION}) ==="
+cd /tmp/jenkins-build
+echo "Deploying ${deployName} ..."
+envsubst < ${manifest} \
+    | docker exec -i k8s-lab-control-plane kubectl apply ${nsOpt} -f -
 
-                        # Substitute variables in manifest and apply
-                        envsubst < "${MANIFEST}" | kubectl apply -n "${NAMESPACE}" -f -
+docker exec k8s-lab-control-plane kubectl \
+    rollout status deployment/${deployName} ${nsOpt} --timeout=300s
 
-                        echo "→ Waiting for rollout of ${DEPLOYMENT}..."
-                        kubectl rollout status deployment/"${DEPLOYMENT}" \
-                            -n "${NAMESPACE}" --timeout=300s
+echo "${deployName} is ready"
+"""
 
-                        echo "→ ${DEPLOYMENT} is ready"
-                    '''
+                    sh """
+                        scp ${SSH_OPTS} deploy.sh '${rhost}':/tmp/deploy.sh
+                        ssh ${SSH_OPTS} '${rhost}' 'bash /tmp/deploy.sh'
+                    """
                 }
             }
         }
 
-        // ── Stage 4: Smoke test the INACTIVE track ────────────────
-        stage('Smoke Test') {
-            when { expression { params.SMOKE_TEST_ENABLED == 'yes' } }
-            steps {
-                script {
-                    unstash 'track'
-                    sh '''
-                        . ./track.env
-                        echo "=== Smoke testing ${INACTIVE_VERSION} track ==="
-
-                        # Create ephemeral preview service pointing to inactive pods
-                        envsubst < "${K8S_MANIFEST_DIR}/preview-service.yaml" \
-                            | kubectl apply -n "${NAMESPACE}" -f -
-
-                        # Port-forward to the preview service for local curl
-                        kubectl port-forward svc/"${PREVIEW_SVC}" -n "${NAMESPACE}" 18080:8080 &
-                        PF_PID=$!
-                        sleep 3
-
-                        # ── Health check
-                        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-                            http://localhost:18080/healthz || echo "000")
-
-                        # Kill port-forward
-                        kill ${PF_PID} 2>/dev/null || true
-
-                        echo "→ Health check HTTP ${HTTP_CODE}"
-
-                        if [ "${HTTP_CODE}" != "200" ]; then
-                            echo "!!! Smoke test FAILED — aborting"
-                            kubectl delete svc "${PREVIEW_SVC}" -n "${NAMESPACE}" --ignore-not-found
-                            exit 1
-                        fi
-                        echo "→ Smoke test PASSED"
-                    '''
-                }
-            }
-            post {
-                always {
-                    sh "kubectl delete svc ${PREVIEW_SVC} -n ${NAMESPACE} --ignore-not-found"
-                }
-            }
-        }
-
-        // ── Stage 5: Approval gate (if AUTO_SWITCH = no) ──────────
-        stage('Approve Switch') {
-            when { expression { params.AUTO_SWITCH == 'no' } }
-            steps {
-                script {
-                    unstash 'track'
-                    def trackProps = readProperties file: 'track.env'
-                    input message: "Switch traffic from ${trackProps.LIVE_VERSION} → ${trackProps.INACTIVE_VERSION}?",
-                          ok: 'Switch Now'
-                }
-            }
-        }
-
-        // ── Stage 6: Switch traffic ───────────────────────────────
-        stage('Switch Traffic') {
-            steps {
-                script {
-                    unstash 'track'
-                    sh '''
-                        . ./track.env
-                        echo "=== Switching traffic: ${LIVE_VERSION} → ${INACTIVE_VERSION} ==="
-
-                        kubectl patch svc "${LIVE_SVC}" -n "${NAMESPACE}" \
-                            --type=merge \
-                            -p "{\"spec\":{\"selector\":{\"version\":\"${INACTIVE_VERSION}\"}}}"
-
-                        echo "→ Traffic now routed to ${INACTIVE_VERSION}"
-                    '''
-                }
-            }
-        }
-
-        // ── Stage 7: Verify live after switch ─────────────────────
-        stage('Verify Live') {
-            steps {
-                script {
-                    unstash 'track'
-                    sh '''
-                        . ./track.env
-                        echo "=== Verifying live traffic on ${INACTIVE_VERSION} ==="
-
-                        # Quick health check via port-forward to the live service
-                        kubectl port-forward svc/"${LIVE_SVC}" -n "${NAMESPACE}" 18081:80 &
-                        PF_PID=$!
-                        sleep 3
-
-                        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-                            http://localhost:18081/healthz || echo "000")
-
-                        kill ${PF_PID} 2>/dev/null || true
-
-                        if [ "${HTTP_CODE}" = "200" ]; then
-                            echo "→ Live verification PASSED (HTTP ${HTTP_CODE})"
-                        else
-                            echo "!!! Live verification returned HTTP ${HTTP_CODE}"
-                            echo "!!! Rolling back..."
-                            kubectl patch svc "${LIVE_SVC}" -n "${NAMESPACE}" \
-                                --type=merge \
-                                -p "{\"spec\":{\"selector\":{\"version\":\"${LIVE_VERSION}\"}}}"
-                            exit 1
-                        fi
-                    '''
-                }
-            }
-        }
-
-        // ── Stage 8: Cleanup old track ────────────────────────────
-        stage('Cleanup') {
-            steps {
-                script {
-                    unstash 'track'
-                    sh '''
-                        . ./track.env
-                        echo "=== Scaling down old ${LIVE_VERSION} track ==="
-                        kubectl scale deployment "${APP_NAME}-${LIVE_VERSION}" \
-                            -n "${NAMESPACE}" --replicas=0 2>/dev/null || true
-                        echo "→ Old track ${LIVE_VERSION} scaled to 0 (kept for rollback)"
-                    '''
-                }
-            }
-        }
-    }
-
-    // ── Post actions ──────────────────────────────────────────────
-    post {
-        success {
-            script {
-                unstash 'track'
-                def trackProps = readProperties file: 'track.env'
-                echo """
-                ╔══════════════════════════════════════════════╗
-                ║  Blue/Green Deployment SUCCESS            ║
-                ║  App:      ${params.APP_NAME}             ║
-                ║  Image:    ${env.IMAGE_TAG}               ║
-                ║  Live:     ${trackProps.INACTIVE_VERSION} ║
-                ╚══════════════════════════════════════════════╝
-                """
-            }
-        }
-        failure {
-            echo "Pipeline FAILED — check logs above"
-        }
     }
 }

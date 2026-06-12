@@ -1,5 +1,6 @@
-# ── Preview Service (ephemeral — created/deleted each pipeline run) ──
-# Exposes the inactive track for smoke testing before switch.
+# ── Preview Service (ephemeral) ──
+# Created during smoke test to expose inactive track inside cluster.
+# Deleted after test completes.
 apiVersion: v1
 kind: Service
 metadata:
