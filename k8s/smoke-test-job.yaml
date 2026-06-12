@@ -1,0 +1,47 @@
+# ── Smoke Test Job — runs inside cluster to verify inactive track ──
+# Created & deleted each pipeline run. Tests the PREVIEW service.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${APP_NAME}-smoke-${INACTIVE_VERSION}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_NAME}
+    purpose: smoke-test
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 60
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+        purpose: smoke-test
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: curl
+          image: curlimages/curl:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "=== Smoke test: ${APP_NAME}-${INACTIVE_VERSION} ==="
+              for i in 1 2 3 4 5; do
+                CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                  "http://${APP_NAME}-preview.${NAMESPACE}.svc.cluster.local:8080/${HEALTH_PATH}")
+                echo "  attempt $i → HTTP $CODE"
+                if [ "$CODE" = "200" ]; then
+                  echo "=== PASSED ==="
+                  exit 0
+                fi
+                sleep 3
+              done
+              echo "=== FAILED after 5 attempts ==="
+              exit 1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
